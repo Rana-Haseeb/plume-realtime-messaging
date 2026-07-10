@@ -1,10 +1,17 @@
 /**
- * Email sender with a zero-dependency dev fallback.
+ * Email sender via Gmail SMTP (nodemailer), with a zero-config dev fallback.
  *
- * - If RESEND_API_KEY is set, sends via the Resend REST API (using global fetch).
- * - Otherwise (dev mode), logs the message + link to the server console so the
- *   password-reset / verification flows are fully testable without a provider.
+ * - If GMAIL_USER + GMAIL_APP_PASSWORD are set, sends real emails through Gmail.
+ * - Otherwise (dev mode / placeholders), logs the message + link to the server
+ *   console so the password-reset / verification flows stay fully testable.
+ *
+ * To enable real sending, in `backend/.env` set:
+ *   GMAIL_USER=your-address@gmail.com
+ *   GMAIL_APP_PASSWORD=your-16-char-app-password   (Google Account → Security →
+ *                                                   2-Step Verification → App passwords)
+ *   MAIL_FROM=Plume <your-address@gmail.com>       (optional display name)
  */
+import nodemailer, { Transporter } from "nodemailer";
 
 interface MailArgs {
   to: string;
@@ -13,38 +20,41 @@ interface MailArgs {
   text?: string;
 }
 
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+
+let transporter: Transporter | null = null;
+
+function getTransporter(): Transporter | null {
+  if (!GMAIL_USER || !GMAIL_APP_PASSWORD) return null;
+  if (!transporter) {
+    transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+    });
+  }
+  return transporter;
+}
+
 export function mailerConfigured(): boolean {
-  return !!process.env.RESEND_API_KEY;
+  return !!(GMAIL_USER && GMAIL_APP_PASSWORD);
 }
 
 export async function sendMail({ to, subject, html, text }: MailArgs): Promise<void> {
-  const key = process.env.RESEND_API_KEY;
-  const from = process.env.MAIL_FROM || "Plume <onboarding@resend.dev>";
+  const tx = getTransporter();
 
-  if (!key) {
+  if (!tx) {
     const plain = text || html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
     console.log(
-      `\n──────── [mailer:dev] email NOT sent (no RESEND_API_KEY) ────────\n` +
+      `\n──────── [mailer:dev] email NOT sent (no GMAIL credentials) ────────\n` +
         `  To:      ${to}\n  Subject: ${subject}\n  Body:    ${plain}\n` +
-        `────────────────────────────────────────────────────────────────\n`
+        `────────────────────────────────────────────────────────────────────\n`
     );
     return;
   }
 
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ from, to, subject, html, text }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    console.error("Mail send failed:", res.status, body);
-    throw new Error("Failed to send email");
-  }
+  const from = process.env.MAIL_FROM || `Plume <${GMAIL_USER}>`;
+  await tx.sendMail({ from, to, subject, html, text });
 }
 
 /** Simple branded HTML wrapper for a call-to-action email. */

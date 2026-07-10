@@ -45,10 +45,10 @@ export default function ResetPasswordPage() {
   }
 
   const inputClass =
-    "w-full rounded-xl border border-[var(--border)] bg-white px-4 py-3 text-[15px] text-[var(--text)] placeholder:text-[var(--text-secondary)] outline-none transition-colors focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]/20";
+    "w-full rounded-xl border border-[var(--border)] bg-[var(--field)] px-4 py-3 text-[15px] text-[var(--text)] placeholder:text-[var(--text-secondary)] outline-none transition-colors focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]/20";
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-white px-4">
+    <div className="flex min-h-screen items-center justify-center bg-[var(--bg)] px-4">
       <main className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center">
           <div className="mb-5 rounded-[1.75rem] shadow-lg shadow-indigo-200">

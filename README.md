@@ -15,7 +15,7 @@ backend backed by **MongoDB**.
 | Backend | Node.js, Express 5, Socket.io, Mongoose 9, JWT, bcrypt, multer |
 | Database | MongoDB (Atlas) |
 | Realtime | Socket.io (messaging + presence + call signaling), WebRTC (media) |
-| Email | Resend (with a console dev-mode fallback) |
+| Email | Gmail SMTP via nodemailer (with a console dev-mode fallback) |
 
 ## Features
 
@@ -38,7 +38,7 @@ backend backed by **MongoDB**.
 
 **Accounts & polish**
 - JWT auth with **login by email _or_ username**, persistent sessions, auto-reconnecting socket
-- **Password reset & email verification** (Resend, with console dev-mode fallback)
+- **Password reset & email verification** (Gmail SMTP, with console dev-mode fallback)
 - **Avatar upload**, **desktop notifications + sound**, **light / dark theme** (persisted)
 - **Settings** panel (WhatsApp-style): Account, Privacy, Security, Chats, Notifications, Help
 - **Rate limiting & abuse protection** (per-IP API limits + per-user socket flood control)
@@ -113,8 +113,9 @@ features (presence, ticks, calls), open a second account in an incognito window.
 | `MONGO_URI` | MongoDB connection string |
 | `JWT_SECRET` | Long random secret for signing tokens |
 | `JWT_EXPIRES_IN` | Token lifetime (e.g. `7d`) |
-| `RESEND_API_KEY` | _Optional_ — [Resend](https://resend.com) key for real emails; blank = dev mode (links logged to console) |
-| `MAIL_FROM` | _Optional_ — sender, e.g. `Plume <onboarding@resend.dev>` |
+| `GMAIL_USER` | _Optional_ — Gmail address for sending; blank = dev mode (links logged to console) |
+| `GMAIL_APP_PASSWORD` | _Optional_ — Gmail [App Password](https://myaccount.google.com/apppasswords) (needs 2-Step Verification) |
+| `MAIL_FROM` | _Optional_ — sender display name, e.g. `Plume <you@gmail.com>` |
 
 **`frontend/.env.local`**
 

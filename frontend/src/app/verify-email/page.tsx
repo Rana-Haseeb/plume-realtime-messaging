@@ -44,7 +44,7 @@ export default function VerifyEmailPage() {
   }, []);
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-white px-4">
+    <div className="flex min-h-screen items-center justify-center bg-[var(--bg)] px-4">
       <main className="w-full max-w-sm text-center">
         <div className="mb-6 flex flex-col items-center">
           <div className="mb-5 rounded-[1.75rem] shadow-lg shadow-indigo-200">
