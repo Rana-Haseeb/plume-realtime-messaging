@@ -94,6 +94,15 @@ export interface ClientToServerEvents {
   ) => void;
 
   // Communities
+  pin_message: (
+    payload: { roomId: string; messageId: string; pin: boolean },
+    ack?: (res: RoomAck) => void
+  ) => void;
+  star_message: (
+    payload: { messageId: string; star: boolean },
+    ack?: (res: { ok: boolean; error?: string }) => void
+  ) => void;
+  delete_dm: (roomId: string, ack?: (res: { ok: boolean; error?: string }) => void) => void;
   community_request: (
     roomId: string,
     ack?: (res: { ok: boolean; error?: string }) => void

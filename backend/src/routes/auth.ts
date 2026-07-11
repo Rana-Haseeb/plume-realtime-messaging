@@ -5,7 +5,9 @@ import multer from "multer";
 import crypto from "crypto";
 import path from "path";
 import fs from "fs";
+import { Types } from "mongoose";
 import User, { IUser } from "../models/User";
+import Report from "../models/Report";
 import { requireAuth, AuthRequest, getJwtSecret } from "../middleware/auth";
 import { rateLimit } from "../middleware/rateLimit";
 import { sendMail, actionEmail } from "../utils/mailer";
@@ -91,6 +93,7 @@ function publicUser(user: IUser) {
     lastSeenVisible: user.lastSeenVisible,
     readReceipts: user.readReceipts,
     emailVerified: user.emailVerified,
+    blocked: (user.blocked ?? []).map((b) => b.toString()),
   };
 }
 
@@ -397,6 +400,74 @@ router.post(
     }
   }
 );
+
+// POST /api/auth/block — block a user
+router.post("/block", requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { userId } = req.body ?? {};
+    if (!Types.ObjectId.isValid(userId) || userId === req.userId) {
+      res.status(400).json({ error: "Invalid user" });
+      return;
+    }
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      { $addToSet: { blocked: userId } },
+      { new: true }
+    );
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+    res.json({ user: publicUser(user) });
+  } catch (err) {
+    console.error("Block error:", err);
+    res.status(500).json({ error: "Failed to block user" });
+  }
+});
+
+// POST /api/auth/unblock — unblock a user
+router.post("/unblock", requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { userId } = req.body ?? {};
+    if (!Types.ObjectId.isValid(userId)) {
+      res.status(400).json({ error: "Invalid user" });
+      return;
+    }
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      { $pull: { blocked: userId } },
+      { new: true }
+    );
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+    res.json({ user: publicUser(user) });
+  } catch (err) {
+    console.error("Unblock error:", err);
+    res.status(500).json({ error: "Failed to unblock user" });
+  }
+});
+
+// POST /api/auth/report — report a user
+router.post("/report", requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { userId, reason } = req.body ?? {};
+    if (!Types.ObjectId.isValid(userId) || userId === req.userId) {
+      res.status(400).json({ error: "Invalid user" });
+      return;
+    }
+    await Report.create({
+      reporter: req.userId,
+      reportedUser: userId,
+      reason: typeof reason === "string" ? reason.slice(0, 500) : "",
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("Report error:", err);
+    res.status(500).json({ error: "Failed to submit report" });
+  }
+});
 
 // GET /api/auth/me
 router.get("/me", requireAuth, async (req: AuthRequest, res: Response) => {

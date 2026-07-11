@@ -1,4 +1,4 @@
-import mongoose, { Schema, Document } from "mongoose";
+import mongoose, { Schema, Document, Types } from "mongoose";
 
 export interface IUser extends Document {
   id: string;
@@ -9,6 +9,7 @@ export interface IUser extends Document {
   bio: string;
   onlineStatus: boolean;
   lastSeen: Date;
+  blocked: Types.ObjectId[];
   // Privacy settings
   lastSeenVisible: boolean;
   readReceipts: boolean;
@@ -61,6 +62,8 @@ const userSchema = new Schema<IUser>(
       type: Date,
       default: Date.now,
     },
+    // Users this person has blocked
+    blocked: [{ type: Schema.Types.ObjectId, ref: "User" }],
     // When false, this user's online status / last seen is hidden from others
     lastSeenVisible: {
       type: Boolean,

@@ -7,6 +7,8 @@ export interface IChatRoom extends Document {
   participants: Types.ObjectId[];
   admins: Types.ObjectId[];
   joinRequests: Types.ObjectId[];
+  pinnedMessages: Types.ObjectId[];
+  hiddenFor: Types.ObjectId[];
   description: string;
   avatar: string;
 }
@@ -50,6 +52,10 @@ const chatRoomSchema = new Schema<IChatRoom>(
         ref: "User",
       },
     ],
+    // Pinned messages in this room
+    pinnedMessages: [{ type: Schema.Types.ObjectId, ref: "Message" }],
+    // Users who "deleted" (hid) this chat; cleared when new activity arrives
+    hiddenFor: [{ type: Schema.Types.ObjectId, ref: "User" }],
     description: {
       type: String,
       default: "",

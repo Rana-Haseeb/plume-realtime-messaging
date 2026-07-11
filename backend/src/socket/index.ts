@@ -78,6 +78,7 @@ async function buildRoomDTO(room: any): Promise<RoomDTO> {
   const populated = await room.populate([
     { path: "participants", select: PARTICIPANT_FIELDS },
     { path: "joinRequests", select: "username avatar" },
+    { path: "pinnedMessages", populate: { path: "sender", select: SENDER_FIELDS } },
   ]);
   return populated.toJSON() as unknown as RoomDTO;
 }
@@ -150,9 +151,16 @@ export function registerSocketHandlers(io: ChatServer) {
 
     socket.on("join_private_room", async (recipientId, ack) => {
       try {
-        const recipient = await User.findById(recipientId).select("username");
+        const recipient = await User.findById(recipientId).select("username blocked");
         if (!recipient || recipientId === userId) {
           ack({ ok: false, error: "Recipient not found" });
+          return;
+        }
+        const me = await User.findById(userId).select("blocked");
+        const iBlocked = me?.blocked?.some((b) => b.toString() === recipientId);
+        const theyBlocked = recipient.blocked?.some((b) => b.toString() === userId);
+        if (iBlocked || theyBlocked) {
+          ack({ ok: false, error: "You can't message this user." });
           return;
         }
         const participants = [userId, recipientId];
@@ -195,7 +203,32 @@ export function registerSocketHandlers(io: ChatServer) {
         }
 
         const others = room.participants.map((p) => p.toString()).filter((id) => id !== userId);
+
+        // Block enforcement for DMs: refuse if either party blocked the other
+        if (!room.isGroup && others.length === 1) {
+          const me = await User.findById(userId).select("blocked");
+          const other = await User.findById(others[0]).select("blocked");
+          const iBlocked = me?.blocked?.some((b) => b.toString() === others[0]);
+          const theyBlocked = other?.blocked?.some((b) => b.toString() === userId);
+          if (iBlocked || theyBlocked) {
+            ack({ ok: false, error: "You can't message this user." });
+            return;
+          }
+        }
+
         const onlineOthers = others.filter((id) => isUserOnline(io, id));
+
+        // Resolve @mentions against room participants
+        const mentions: string[] = [];
+        const handles = (text.match(/@(\w+)/g) ?? []).map((h) => h.slice(1).toLowerCase());
+        if (handles.length > 0) {
+          const populatedRoom = await room.populate("participants", "username");
+          for (const p of populatedRoom.participants as unknown as { _id: Types.ObjectId; username: string }[]) {
+            if (handles.includes(p.username.toLowerCase()) && p._id.toString() !== userId) {
+              mentions.push(p._id.toString());
+            }
+          }
+        }
 
         const message = await Message.create({
           sender: userId,
@@ -203,6 +236,7 @@ export function registerSocketHandlers(io: ChatServer) {
           content: text,
           attachment: attachment ?? null,
           replyTo: replyTo && Types.ObjectId.isValid(replyTo) ? replyTo : null,
+          mentions,
           readBy: [userId],
           deliveredTo: [userId, ...onlineOthers],
         });
@@ -211,6 +245,8 @@ export function registerSocketHandlers(io: ChatServer) {
         const dto = message.toJSON() as unknown as MessageDTO;
 
         room.set({ updatedAt: new Date() });
+        // New activity un-hides the chat for anyone who "deleted" it
+        if (room.hiddenFor.length > 0) room.hiddenFor = [];
         await room.save();
 
         joinUserSockets(io, [userId, ...others], room.id);
@@ -250,6 +286,75 @@ export function registerSocketHandlers(io: ChatServer) {
         });
       } catch (err) {
         console.error("react_message error:", err);
+      }
+    });
+
+    /* ---------- Pin / unpin a message ---------- */
+    socket.on("pin_message", async ({ roomId, messageId, pin }, ack) => {
+      try {
+        const room = await ChatRoom.findOne({ _id: roomId, participants: userId });
+        if (!room) return ack?.({ ok: false, error: "Room not found" });
+        // In groups/communities only admins may pin
+        if (room.isGroup && !room.admins.some((a) => a.toString() === userId)) {
+          return ack?.({ ok: false, error: "Only admins can pin messages" });
+        }
+        const exists = await Message.exists({ _id: messageId, room: roomId });
+        if (!exists) return ack?.({ ok: false, error: "Message not found" });
+
+        const mid = new Types.ObjectId(messageId);
+        const has = room.pinnedMessages.some((p) => p.toString() === messageId);
+        if (pin && !has) room.pinnedMessages.push(mid);
+        else if (!pin && has) {
+          room.pinnedMessages = room.pinnedMessages.filter((p) => p.toString() !== messageId);
+        }
+        await room.save();
+        const dto = await buildRoomDTO(room);
+        io.to(room.id).emit("room_updated", dto);
+        ack?.({ ok: true, room: dto });
+      } catch (err) {
+        console.error("pin_message error:", err);
+        ack?.({ ok: false, error: "Failed to pin message" });
+      }
+    });
+
+    /* ---------- Star / bookmark a message (per-user) ---------- */
+    socket.on("star_message", async ({ messageId, star }, ack) => {
+      try {
+        const msg = await Message.findById(messageId);
+        if (!msg) return ack?.({ ok: false, error: "Message not found" });
+        const member = await ChatRoom.exists({ _id: msg.room, participants: userId });
+        if (!member) return ack?.({ ok: false, error: "Not allowed" });
+
+        const uid = new Types.ObjectId(userId);
+        const has = msg.starredBy.some((s) => s.toString() === userId);
+        if (star && !has) msg.starredBy.push(uid);
+        else if (!star && has) {
+          msg.starredBy = msg.starredBy.filter((s) => s.toString() !== userId);
+        }
+        await msg.save();
+        ack?.({ ok: true });
+      } catch (err) {
+        console.error("star_message error:", err);
+        ack?.({ ok: false, error: "Failed to star message" });
+      }
+    });
+
+    /* ---------- Delete (hide) a DM for the current user ---------- */
+    socket.on("delete_dm", async (roomId, ack) => {
+      try {
+        const room = await ChatRoom.findOne({ _id: roomId, isGroup: false, participants: userId });
+        if (!room) return ack?.({ ok: false, error: "Chat not found" });
+        if (!room.hiddenFor.some((h) => h.toString() === userId)) {
+          room.hiddenFor.push(new Types.ObjectId(userId));
+          await room.save();
+        }
+        // Remove it from this user's other tabs
+        io.to(`user:${userId}`).emit("removed_from_room", { roomId: room.id });
+        leaveUserSockets(io, userId, room.id);
+        ack?.({ ok: true });
+      } catch (err) {
+        console.error("delete_dm error:", err);
+        ack?.({ ok: false, error: "Failed to delete chat" });
       }
     });
 

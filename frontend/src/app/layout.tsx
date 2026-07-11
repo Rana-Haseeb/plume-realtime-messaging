@@ -14,8 +14,8 @@ export const metadata: Metadata = {
   description: "Plume — conversations, light as a feather.",
 };
 
-// Apply the saved theme before first paint to avoid a flash of the wrong theme.
-const themeScript = `(function(){try{var t=localStorage.getItem('nexchat_theme');if(t!=='light'&&t!=='dark'){t=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}document.documentElement.dataset.theme=t;}catch(e){}})();`;
+// Apply the saved theme + wallpaper before first paint (avoids a flash).
+const themeScript = `(function(){try{var t=localStorage.getItem('nexchat_theme');if(t!=='light'&&t!=='dark'){t=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';}document.documentElement.dataset.theme=t;var w=localStorage.getItem('nexchat_wallpaper');if(w){document.documentElement.dataset.wallpaper=w;}}catch(e){}})();`;
 
 export default function RootLayout({
   children,

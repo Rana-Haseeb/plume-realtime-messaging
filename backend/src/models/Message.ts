@@ -1,11 +1,12 @@
 import mongoose, { Schema, Document, Types } from "mongoose";
 
 export interface IAttachment {
-  type: "image" | "file";
+  type: "image" | "audio" | "file";
   url: string;
   name: string;
   size: number;
   mime: string;
+  duration?: number; // seconds, for audio
 }
 
 export interface IReaction {
@@ -20,6 +21,8 @@ export interface IMessage extends Document {
   attachment: IAttachment | null;
   replyTo: Types.ObjectId | null;
   reactions: IReaction[];
+  mentions: Types.ObjectId[];
+  starredBy: Types.ObjectId[];
   timestamp: Date;
   readBy: Types.ObjectId[];
   deliveredTo: Types.ObjectId[];
@@ -30,11 +33,12 @@ export interface IMessage extends Document {
 
 const attachmentSchema = new Schema<IAttachment>(
   {
-    type: { type: String, enum: ["image", "file"] },
+    type: { type: String, enum: ["image", "audio", "file"] },
     url: String,
     name: String,
     size: Number,
     mime: String,
+    duration: Number,
   },
   { _id: false }
 );
@@ -76,6 +80,10 @@ const messageSchema = new Schema<IMessage>(
         emoji: String,
       },
     ],
+    // Participants @mentioned in this message (resolved server-side)
+    mentions: [{ type: Schema.Types.ObjectId, ref: "User" }],
+    // Users who starred/bookmarked this message (per-user)
+    starredBy: [{ type: Schema.Types.ObjectId, ref: "User" }],
     timestamp: {
       type: Date,
       default: Date.now,

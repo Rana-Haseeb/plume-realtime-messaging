@@ -10,6 +10,7 @@ export interface User {
   lastSeenVisible?: boolean;
   readReceipts?: boolean;
   emailVerified?: boolean;
+  blocked?: string[];
 }
 
 export interface Room {
@@ -20,10 +21,12 @@ export interface Room {
   participants: User[];
   admins: string[];
   joinRequests?: User[];
+  pinnedMessages?: Message[];
   description: string;
   avatar?: string;
   updatedAt?: string;
   lastMessage?: Message | null;
+  unreadCount?: number;
 }
 
 export interface CommunitySummary {
@@ -38,11 +41,12 @@ export interface CommunitySummary {
 }
 
 export interface Attachment {
-  type: "image" | "file";
+  type: "image" | "audio" | "file";
   url: string;
   name: string;
   size: number;
   mime: string;
+  duration?: number;
 }
 
 export interface Reaction {
@@ -66,6 +70,8 @@ export interface Message {
   attachment?: Attachment | null;
   replyTo?: ReplySnapshot | null;
   reactions: Reaction[];
+  mentions?: string[];
+  starredBy?: string[];
   timestamp: string;
   readBy: string[];
   deliveredTo: string[];

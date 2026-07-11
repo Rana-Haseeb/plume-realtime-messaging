@@ -61,9 +61,13 @@ function roomJSON(room: any): Record<string, any> {
 
 // GET /api/rooms — rooms the current user participates in, with last message
 router.get("/", async (req: AuthRequest, res: Response) => {
-  const rooms = await ChatRoom.find({ participants: req.userId })
+  const rooms = await ChatRoom.find({
+    participants: req.userId,
+    hiddenFor: { $ne: req.userId },
+  })
     .populate("participants", PARTICIPANT_FIELDS)
     .populate("joinRequests", "username avatar")
+    .populate({ path: "pinnedMessages", populate: { path: "sender", select: "username avatar" } })
     .sort({ updatedAt: -1 });
 
   const withLastMessage = await Promise.all(
@@ -71,12 +75,49 @@ router.get("/", async (req: AuthRequest, res: Response) => {
       const lastMessage = await Message.findOne({ room: room._id })
         .sort({ timestamp: -1 })
         .populate("sender", "username avatar");
-      return { ...roomJSON(room), lastMessage };
+      // Persistent unread count: messages from others this user hasn't read
+      const unreadCount = await Message.countDocuments({
+        room: room._id,
+        sender: { $ne: req.userId },
+        readBy: { $ne: req.userId },
+        deleted: { $ne: true },
+      });
+      return { ...roomJSON(room), lastMessage, unreadCount };
     })
   );
 
   res.json({ rooms: withLastMessage });
 });
+
+// GET /api/rooms/:id/messages/:messageId/readers — who has read a message
+router.get(
+  "/:id/messages/:messageId/readers",
+  async (req: AuthRequest, res: Response) => {
+    const { id, messageId } = req.params as { id: string; messageId: string };
+    if (!Types.ObjectId.isValid(id) || !Types.ObjectId.isValid(messageId)) {
+      res.status(400).json({ error: "Invalid id" });
+      return;
+    }
+    const room = await ChatRoom.findOne({ _id: id, participants: req.userId }).select("_id");
+    if (!room) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+    const msg = await Message.findOne({ _id: messageId, room: id }).populate(
+      "readBy",
+      "username avatar"
+    );
+    if (!msg) {
+      res.status(404).json({ error: "Message not found" });
+      return;
+    }
+    // Everyone who read it, excluding the sender themselves
+    const readers = (msg.readBy as unknown as { _id: Types.ObjectId; username: string; avatar: string }[]).filter(
+      (u) => u._id.toString() !== msg.sender.toString()
+    );
+    res.json({ readers });
+  }
+);
 
 // POST /api/rooms — create a room (group or 1:1)
 router.post("/", async (req: AuthRequest, res: Response) => {
@@ -120,6 +161,18 @@ router.post("/", async (req: AuthRequest, res: Response) => {
     console.error("Create room error:", err);
     res.status(500).json({ error: "Failed to create room" });
   }
+});
+
+// GET /api/rooms/starred — the current user's starred/bookmarked messages
+router.get("/starred", async (req: AuthRequest, res: Response) => {
+  const messages = await Message.find({
+    starredBy: req.userId,
+    deleted: { $ne: true },
+  })
+    .populate("sender", "username avatar")
+    .sort({ timestamp: -1 })
+    .limit(100);
+  res.json({ messages });
 });
 
 // GET /api/rooms/communities — all public communities (discovery)
@@ -170,10 +223,11 @@ router.post(
       res.status(400).json({ error: "No file uploaded" });
       return;
     }
-    const isImage = /^image\//.test(req.file.mimetype);
+    const mime = req.file.mimetype;
+    const type = /^image\//.test(mime) ? "image" : /^audio\//.test(mime) ? "audio" : "file";
     res.json({
       attachment: {
-        type: isImage ? "image" : "file",
+        type,
         url: fileUrl(req, req.file.filename),
         name: req.file.originalname,
         size: req.file.size,

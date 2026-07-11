@@ -16,11 +16,12 @@ export interface UserDTO {
 }
 
 export interface AttachmentDTO {
-  type: "image" | "file";
+  type: "image" | "audio" | "file";
   url: string;
   name: string;
   size: number;
   mime: string;
+  duration?: number;
 }
 
 export interface ReactionDTO {
@@ -45,6 +46,8 @@ export interface MessageDTO {
   attachment?: AttachmentDTO | null;
   replyTo?: ReplyDTO | null;
   reactions: ReactionDTO[];
+  mentions: string[];
+  starredBy: string[];
   timestamp: string | Date;
   readBy: string[];
   deliveredTo: string[];
@@ -60,6 +63,7 @@ export interface RoomDTO {
   participants: UserDTO[];
   admins: string[];
   joinRequests?: UserDTO[];
+  pinnedMessages?: MessageDTO[];
   description: string;
   avatar?: string;
   updatedAt?: string | Date;
@@ -183,6 +187,17 @@ export interface ClientToServerEvents {
     ack?: (res: RoomAck) => void
   ) => void;
   group_leave: (roomId: string, ack?: (res: { ok: boolean; error?: string }) => void) => void;
+
+  // Pin & star
+  pin_message: (
+    payload: { roomId: string; messageId: string; pin: boolean },
+    ack?: (res: RoomAck) => void
+  ) => void;
+  star_message: (
+    payload: { messageId: string; star: boolean },
+    ack?: (res: { ok: boolean; error?: string }) => void
+  ) => void;
+  delete_dm: (roomId: string, ack?: (res: { ok: boolean; error?: string }) => void) => void;
 
   // Communities
   community_request: (

@@ -21,6 +21,7 @@ import {
   userId,
 } from "@/lib/types";
 import { playPing, showDesktopNotification } from "@/lib/notifications";
+import { aiRewrite, aiTranslate, aiSuggestReplies } from "@/lib/ai";
 import Avatar from "@/components/Avatar";
 import SettingsModal from "@/components/SettingsModal";
 import CallOverlay from "@/components/CallOverlay";
@@ -80,6 +81,18 @@ function lastSeenLabel(iso?: string | null) {
 function displayName(room: Room, meId: string) {
   if (room.isGroup) return room.name;
   return room.participants.find((p) => userId(p) !== meId)?.username ?? room.name;
+}
+/** Render message text with @mentions highlighted. */
+function renderContent(text: string) {
+  return text.split(/(@\w+)/g).map((part, i) =>
+    /^@\w+$/.test(part) ? (
+      <span key={i} className="font-medium text-[var(--accent)]">
+        {part}
+      </span>
+    ) : (
+      part
+    )
+  );
 }
 function roomAvatar(room: Room, meId: string): string | undefined {
   if (room.isGroup) return room.avatar || undefined;
@@ -149,6 +162,24 @@ export default function ChatPage() {
   const [showInfo, setShowInfo] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showGroupManage, setShowGroupManage] = useState(false);
+  const [forwardMsg, setForwardMsg] = useState<Message | null>(null);
+  const [seenBy, setSeenBy] = useState<{ readers: User[] } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [starred, setStarred] = useState<Message[] | null>(null);
+  const [reportSent, setReportSent] = useState(false);
+  // AI features
+  const [aiMenuOpen, setAiMenuOpen] = useState(false);
+  const [aiBusy, setAiBusy] = useState<string | null>(null);
+  const [aiPreview, setAiPreview] = useState<{ label: string; text: string } | null>(null);
+  const [replySuggestions, setReplySuggestions] = useState<string[] | null>(null);
+  const [translations, setTranslations] = useState<Record<string, string>>({});
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recSeconds, setRecSeconds] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recChunksRef = useRef<Blob[]>([]);
+  const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recStreamRef = useRef<MediaStream | null>(null);
   const [verifyBanner, setVerifyBanner] = useState<"idle" | "sent" | "hidden">("idle");
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [chatSearchOpen, setChatSearchOpen] = useState(false);
@@ -195,7 +226,10 @@ export default function ChatPage() {
       })
       .catch(() => {});
     api<{ rooms: Room[] }>("/api/rooms")
-      .then((r) => setRooms(r.rooms))
+      .then((r) => {
+        setRooms(r.rooms);
+        setUnread(Object.fromEntries(r.rooms.map((rm) => [rm._id, rm.unreadCount ?? 0])));
+      })
       .catch((err) => {
         if (/token|401/i.test((err as Error).message)) {
           clearSession();
@@ -217,8 +251,12 @@ export default function ChatPage() {
       } else if (!mine) {
         setUnread((prev) => ({ ...prev, [msg.room]: (prev[msg.room] ?? 0) + 1 }));
       }
-      if (!mine && (document.hidden || !active)) {
-        showDesktopNotification(msg.sender.username, attachmentLabel(msg));
+      const mentioned = msg.mentions?.includes(meIdRef.current);
+      if (!mine && (document.hidden || !active || mentioned)) {
+        showDesktopNotification(
+          mentioned ? `${msg.sender.username} mentioned you` : msg.sender.username,
+          attachmentLabel(msg)
+        );
         playPing();
       }
       setRooms((prev) => {
@@ -299,7 +337,12 @@ export default function ChatPage() {
         hadConnected.current = true;
         return;
       }
-      api<{ rooms: Room[] }>("/api/rooms").then((r) => setRooms(r.rooms)).catch(() => {});
+      api<{ rooms: Room[] }>("/api/rooms")
+        .then((r) => {
+          setRooms(r.rooms);
+          setUnread(Object.fromEntries(r.rooms.map((rm) => [rm._id, rm.unreadCount ?? 0])));
+        })
+        .catch(() => {});
       const roomId = activeRoomRef.current;
       if (roomId) {
         api<{ messages: Message[]; hasMore: boolean }>(`/api/rooms/${roomId}/messages?limit=${PAGE_SIZE}`)
@@ -563,6 +606,89 @@ export default function ChatPage() {
     }
   }
 
+  /* ---------- Voice messages ---------- */
+  function stopRecTracks() {
+    recStreamRef.current?.getTracks().forEach((t) => t.stop());
+    recStreamRef.current = null;
+    if (recTimerRef.current) {
+      clearInterval(recTimerRef.current);
+      recTimerRef.current = null;
+    }
+  }
+  async function startRecording() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recStreamRef.current = stream;
+      const mr = new MediaRecorder(stream);
+      recChunksRef.current = [];
+      mr.ondataavailable = (e) => {
+        if (e.data.size) recChunksRef.current.push(e.data);
+      };
+      mr.start();
+      mediaRecorderRef.current = mr;
+      setRecording(true);
+      setRecSeconds(0);
+      recTimerRef.current = setInterval(() => setRecSeconds((s) => s + 1), 1000);
+    } catch {
+      console.error("Microphone access denied");
+    }
+  }
+  function cancelRecording() {
+    const mr = mediaRecorderRef.current;
+    if (mr) {
+      mr.onstop = null;
+      try {
+        mr.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    mediaRecorderRef.current = null;
+    recChunksRef.current = [];
+    stopRecTracks();
+    setRecording(false);
+    setRecSeconds(0);
+  }
+  function sendRecording() {
+    const mr = mediaRecorderRef.current;
+    if (!mr) return;
+    const duration = recSeconds;
+    mr.onstop = async () => {
+      const blob = new Blob(recChunksRef.current, { type: mr.mimeType || "audio/webm" });
+      stopRecTracks();
+      setRecording(false);
+      setRecSeconds(0);
+      mediaRecorderRef.current = null;
+      if (!blob.size || !activeRoomId || !socket) return;
+      try {
+        const form = new FormData();
+        form.append("file", blob, `voice-${Date.now()}.webm`);
+        const res = await fetch(`${API_URL}/api/rooms/upload`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${getToken()}` },
+          body: form,
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error);
+        stickToBottom.current = true;
+        socket.emit(
+          "send_message",
+          { roomId: activeRoomId, attachment: { ...body.attachment, duration } },
+          (r) => {
+            if (!r?.ok) console.error("Voice send failed:", r?.error);
+          }
+        );
+      } catch (e) {
+        console.error("Voice send failed:", e);
+      }
+    };
+    try {
+      mr.stop();
+    } catch {
+      /* ignore */
+    }
+  }
+
   function startEdit(msg: Message) {
     setEditing({ id: msg._id, content: msg.content });
     setDraft(msg.content);
@@ -583,6 +709,151 @@ export default function ChatPage() {
   function react(messageId: string, emoji: string) {
     setMenuFor(null);
     socket?.emit("react_message", { messageId, emoji });
+  }
+  function copyMessage(msg: Message) {
+    setMenuFor(null);
+    navigator.clipboard
+      ?.writeText(msg.content)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      })
+      .catch(() => {});
+  }
+  function forwardMessage(msg: Message) {
+    setMenuFor(null);
+    setForwardMsg(msg);
+  }
+  function doForward(roomId: string) {
+    if (!forwardMsg || !socket) return;
+    socket.emit(
+      "send_message",
+      { roomId, content: forwardMsg.content, attachment: forwardMsg.attachment ?? null },
+      (res) => {
+        if (!res?.ok) console.error("Forward failed:", res?.error);
+      }
+    );
+    setForwardMsg(null);
+    setActiveRoomId(roomId);
+  }
+  function openSeenBy(msg: Message) {
+    setMenuFor(null);
+    if (!activeRoomId) return;
+    api<{ readers: User[] }>(`/api/rooms/${activeRoomId}/messages/${msg._id}/readers`)
+      .then((d) => setSeenBy({ readers: d.readers }))
+      .catch(() => setSeenBy({ readers: [] }));
+  }
+  function toggleStar(msg: Message) {
+    setMenuFor(null);
+    const star = !msg.starredBy?.includes(meId);
+    socket?.emit("star_message", { messageId: msg._id, star });
+    setMessages((prev) =>
+      prev.map((m) =>
+        m._id === msg._id
+          ? {
+              ...m,
+              starredBy: star
+                ? [...(m.starredBy ?? []), meId]
+                : (m.starredBy ?? []).filter((x) => x !== meId),
+            }
+          : m
+      )
+    );
+  }
+  function togglePin(msg: Message) {
+    setMenuFor(null);
+    if (!activeRoomId) return;
+    const pinned = activeRoom?.pinnedMessages?.some((p) => p._id === msg._id) ?? false;
+    socket?.emit("pin_message", { roomId: activeRoomId, messageId: msg._id, pin: !pinned }, (res) => {
+      if (!res?.ok) console.error("Pin failed:", res?.error);
+    });
+  }
+  function openStarred() {
+    api<{ messages: Message[] }>("/api/rooms/starred")
+      .then((d) => setStarred(d.messages))
+      .catch(() => setStarred([]));
+  }
+  async function blockUser(uid: string, block: boolean) {
+    try {
+      const data = await api<{ user: User }>(`/api/auth/${block ? "block" : "unblock"}`, {
+        method: "POST",
+        body: JSON.stringify({ userId: uid }),
+      });
+      const t = getToken();
+      if (t) saveSession(t, data.user);
+      setMe(data.user);
+    } catch (err) {
+      console.error("Block failed:", err);
+    }
+  }
+  function reportUser(uid: string) {
+    api("/api/auth/report", { method: "POST", body: JSON.stringify({ userId: uid, reason: "" }) })
+      .then(() => {
+        setCopied(false);
+        setReportSent(true);
+        setTimeout(() => setReportSent(false), 2000);
+      })
+      .catch(() => {});
+  }
+  function deleteChat(roomId: string) {
+    socket?.emit("delete_dm", roomId, (res) => {
+      if (res?.ok) {
+        setRooms((prev) => prev.filter((r) => r._id !== roomId));
+        setActiveRoomId(null);
+        setShowInfo(false);
+      }
+    });
+  }
+
+  function flashAiError(err: unknown) {
+    const msg = err instanceof Error ? err.message : "AI request failed";
+    setAiError(msg.includes("not configured") ? "AI is not enabled on the server." : "AI is busy — try again.");
+    setTimeout(() => setAiError(null), 2500);
+  }
+  // Rewrite / translate the user's own draft; result shown in a preview bar.
+  async function composeWithAi(kind: "rewrite" | "translate", tone?: string) {
+    const text = draft.trim();
+    setAiMenuOpen(false);
+    if (!text || aiBusy) return;
+    setAiBusy("compose");
+    try {
+      if (kind === "rewrite") {
+        setAiPreview({ label: tone ? `Rewritten (${tone})` : "Rewritten", text: await aiRewrite(text, tone) });
+      } else {
+        setAiPreview({ label: "Translated to English", text: await aiTranslate(text, "English") });
+      }
+    } catch (err) {
+      flashAiError(err);
+    } finally {
+      setAiBusy(null);
+    }
+  }
+  // Translate a received message; shown beneath its bubble.
+  async function translateMessage(msg: Message) {
+    setMenuFor(null);
+    if (aiBusy || !msg.content) return;
+    setAiBusy("t:" + msg._id);
+    try {
+      const result = await aiTranslate(msg.content, "English");
+      setTranslations((prev) => ({ ...prev, [msg._id]: result }));
+    } catch (err) {
+      flashAiError(err);
+    } finally {
+      setAiBusy(null);
+    }
+  }
+  // Suggest three replies to a received message; shown as chips above composer.
+  async function suggestReplies(msg: Message) {
+    setMenuFor(null);
+    if (aiBusy || !msg.content) return;
+    setAiBusy("r:" + msg._id);
+    try {
+      setReplySuggestions(await aiSuggestReplies(msg.content));
+    } catch (err) {
+      flashAiError(err);
+    } finally {
+      setAiBusy(null);
+    }
   }
 
   function handleDraftChange(value: string) {
@@ -769,6 +1040,9 @@ export default function ChatPage() {
               <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
               <path d="M12 3.5v2M12 18.5v2M20.5 12h-2M5.5 12h-2M17.7 6.3l-1.4 1.4M7.7 16.3l-1.4 1.4M17.7 17.7l-1.4-1.4M7.7 7.7 6.3 6.3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
             </svg>
+          </button>
+          <button onClick={openStarred} title="Starred messages" className="rounded-full p-2 text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-secondary)] hover:text-[var(--text)]">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden><path d="m12 4 2.4 5 5.6.6-4 4 1 5.4-5-2.8-5 2.8 1-5.4-4-4 5.6-.6L12 4Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" /></svg>
           </button>
           <button onClick={handleLogout} title="Log out" className="rounded-full p-2 text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-secondary)] hover:text-[var(--danger)]">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -1014,6 +1288,37 @@ export default function ChatPage() {
               )}
             </div>
 
+            {/* Pinned messages bar */}
+            {activeRoom.pinnedMessages && activeRoom.pinnedMessages.length > 0 && (
+              <div className="flex items-center gap-2 border-b border-[var(--border)] bg-[var(--panel)] px-3 py-2">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="shrink-0 text-[var(--accent)]"><path d="M9 4h6l-1 6 3 3v2H7v-2l3-3-1-6ZM12 15v5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                <button
+                  onClick={() => {
+                    const last = activeRoom.pinnedMessages![activeRoom.pinnedMessages!.length - 1];
+                    jumpToMessage({ _id: last._id, timestamp: last.timestamp });
+                  }}
+                  className="min-w-0 flex-1 truncate text-left text-[13px]"
+                >
+                  <span className="font-medium text-[var(--accent)]">Pinned</span>{" "}
+                  <span className="text-[var(--text-secondary)]">
+                    {attachmentLabel(activeRoom.pinnedMessages[activeRoom.pinnedMessages.length - 1])}
+                  </span>
+                </button>
+                {(!activeRoom.isGroup || isAdmin(activeRoom, meId)) && (
+                  <button
+                    onClick={() => {
+                      const last = activeRoom.pinnedMessages![activeRoom.pinnedMessages!.length - 1];
+                      socket?.emit("pin_message", { roomId: activeRoom._id, messageId: last._id, pin: false });
+                    }}
+                    title="Unpin"
+                    className="shrink-0 rounded-full p-1 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+                  </button>
+                )}
+              </div>
+            )}
+
             {/* Messages */}
             <div ref={viewportRef} onScroll={handleViewportScroll} className="min-h-0 flex-1 overflow-y-auto px-2 py-4 md:px-5">
               <div className="flex w-full flex-col gap-1">
@@ -1075,6 +1380,31 @@ export default function ChatPage() {
                                       ))}
                                     </div>
                                     <button onClick={() => startReply(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">Reply</button>
+                                    <button onClick={() => forwardMessage(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">Forward</button>
+                                    {msg.content && (
+                                      <button onClick={() => copyMessage(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">Copy text</button>
+                                    )}
+                                    {!mine && msg.content && (
+                                      <>
+                                        <button onClick={() => translateMessage(msg)} disabled={!!aiBusy} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-50">
+                                          {aiBusy === "t:" + msg._id ? "Translating…" : "Translate"}
+                                        </button>
+                                        <button onClick={() => suggestReplies(msg)} disabled={!!aiBusy} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-50">
+                                          {aiBusy === "r:" + msg._id ? "Thinking…" : "Suggest replies"}
+                                        </button>
+                                      </>
+                                    )}
+                                    <button onClick={() => toggleStar(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">
+                                      {msg.starredBy?.includes(meId) ? "Unstar" : "Star"}
+                                    </button>
+                                    {(!activeRoom.isGroup || isAdmin(activeRoom, meId)) && (
+                                      <button onClick={() => togglePin(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">
+                                        {activeRoom.pinnedMessages?.some((p) => p._id === msg._id) ? "Unpin" : "Pin"}
+                                      </button>
+                                    )}
+                                    {mine && activeRoom.isGroup && (
+                                      <button onClick={() => openSeenBy(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">Seen by</button>
+                                    )}
                                     {mine && (
                                       <>
                                         <button onClick={() => startEdit(msg)} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)]">Edit</button>
@@ -1109,8 +1439,19 @@ export default function ChatPage() {
                               {msg.deleted ? (
                                 <p className="px-1 text-[15px] italic leading-snug text-[var(--text-secondary)]">🚫 This message was deleted<span className="inline-block w-12" /></p>
                               ) : msg.content ? (
-                                <p className="whitespace-pre-wrap break-words px-1 text-[15px] leading-snug">{msg.content}<span className="inline-block w-16" /></p>
+                                <p className="whitespace-pre-wrap break-words px-1 text-[15px] leading-snug">{renderContent(msg.content)}<span className="inline-block w-16" /></p>
                               ) : null}
+
+                              {translations[msg._id] && (
+                                <div className="mx-1 mt-1 rounded-lg border-l-2 border-[var(--accent)] bg-black/5 px-2 py-1 dark:bg-white/5">
+                                  <div className="flex items-center gap-1 text-[11px] font-medium text-[var(--accent)]">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M4 5h8M9 3v2c0 4-2 7-6 9m3-4c2 3 5 4 5 4m8 5-4-9-4 9m1.5-3h5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                                    Translation
+                                    <button onClick={() => setTranslations((p) => { const n = { ...p }; delete n[msg._id]; return n; })} className="ml-auto text-[var(--text-secondary)] hover:text-[var(--text)]">×</button>
+                                  </div>
+                                  <p className="whitespace-pre-wrap break-words text-[14px] leading-snug">{translations[msg._id]}</p>
+                                </div>
+                              )}
 
                               <span className="absolute bottom-1 right-2 flex items-center gap-1 text-[11px] text-[var(--text-secondary)]">
                                 {msg.edited && !msg.deleted && <span>edited</span>}
@@ -1176,28 +1517,101 @@ export default function ChatPage() {
                   </button>
                 </div>
               )}
-              <div className="flex w-full items-center gap-2">
-                {!editing && (
-                  <>
-                    <input ref={fileInputRef} type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = ""; }} />
-                    <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploadingFile} title="Attach file" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-secondary)] disabled:opacity-50">
-                      {uploadingFile ? (
-                        <span className="text-xs">…</span>
+              {aiPreview && (
+                <div className="mb-2 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-3 py-2">
+                  <div className="mb-1 flex items-center gap-1.5 text-[13px] font-medium text-[var(--accent)]">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="m12 3 1.8 4.6L18 9.4l-4.2 1.8L12 16l-1.8-4.8L6 9.4l4.2-1.8L12 3Z" fill="currentColor" /></svg>
+                    {aiPreview.label}
+                    <button type="button" onClick={() => setAiPreview(null)} className="ml-auto rounded-full p-0.5 text-[var(--text-secondary)] hover:text-[var(--text)]" title="Discard">
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+                    </button>
+                  </div>
+                  <p className="whitespace-pre-wrap break-words text-[14px] leading-snug">{aiPreview.text}</p>
+                  <div className="mt-2 flex gap-2">
+                    <button type="button" onClick={() => { setDraft(aiPreview.text); setAiPreview(null); }} className="rounded-full bg-[var(--accent)] px-3 py-1 text-[13px] font-medium text-white hover:bg-[var(--accent-hover)]">Use this</button>
+                    <button type="button" onClick={() => setAiPreview(null)} className="rounded-full px-3 py-1 text-[13px] text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]">Discard</button>
+                  </div>
+                </div>
+              )}
+              {replySuggestions && (
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="text-[12px] font-medium text-[var(--accent)]">Suggested:</span>
+                  {replySuggestions.map((r, i) => (
+                    <button key={i} type="button" onClick={() => { setDraft(r); setReplySuggestions(null); }} className="max-w-full truncate rounded-full border border-[var(--border)] bg-[var(--panel)] px-3 py-1 text-[13px] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]">{r}</button>
+                  ))}
+                  <button type="button" onClick={() => setReplySuggestions(null)} className="rounded-full p-1 text-[var(--text-secondary)] hover:text-[var(--text)]" title="Dismiss">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+                  </button>
+                </div>
+              )}
+              {recording ? (
+                <div className="flex w-full items-center gap-3 rounded-2xl bg-[var(--field)] px-4 py-2.5 shadow-sm">
+                  <button type="button" onClick={cancelRecording} title="Cancel" className="text-[var(--text-secondary)] hover:text-[var(--danger)]">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M6 7h12M9 7V5h6v2m-7 0 1 12h6l1-12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  </button>
+                  <span className="inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-[var(--danger)]" />
+                  <span className="flex-1 tabular-nums text-sm text-[var(--text-secondary)]">
+                    Recording… {Math.floor(recSeconds / 60)}:{(recSeconds % 60).toString().padStart(2, "0")}
+                  </span>
+                  <button type="button" onClick={sendRecording} title="Send voice message" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)]">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 19V5m0 0-6 6m6-6 6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  </button>
+                </div>
+              ) : (
+                <div className="flex w-full items-center gap-2">
+                  {!editing && (
+                    <>
+                      <input ref={fileInputRef} type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadFile(f); e.target.value = ""; }} />
+                      <button type="button" onClick={() => fileInputRef.current?.click()} disabled={uploadingFile} title="Attach file" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-secondary)] disabled:opacity-50">
+                        {uploadingFile ? (
+                          <span className="text-xs">…</span>
+                        ) : (
+                          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l8-8a3.5 3.5 0 1 1 5 5l-8 8a2 2 0 1 1-3-3l7.5-7.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                        )}
+                      </button>
+                    </>
+                  )}
+                  {!editing && (
+                    <div className="relative shrink-0">
+                      <button type="button" onClick={() => setAiMenuOpen((o) => !o)} disabled={aiBusy === "compose"} title="AI writing help" className="flex h-11 w-11 items-center justify-center rounded-full text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)] disabled:opacity-50">
+                        {aiBusy === "compose" ? (
+                          <span className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--accent)] border-t-transparent" />
+                        ) : (
+                          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z" fill="currentColor" /><path d="M19 15l.7 1.8L21.5 17.5l-1.8.7L19 20l-.7-1.8L16.5 17.5l1.8-.7L19 15Z" fill="currentColor" /></svg>
+                        )}
+                      </button>
+                      {aiMenuOpen && (
+                        <>
+                          <div className="fixed inset-0 z-10" onClick={() => setAiMenuOpen(false)} />
+                          <div className="absolute bottom-full left-0 z-20 mb-2 w-52 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--panel)] py-1 shadow-lg">
+                            <p className="px-4 py-1 text-[11px] font-medium uppercase tracking-wide text-[var(--text-secondary)]">Rewrite my message</p>
+                            <button type="button" onClick={() => composeWithAi("rewrite")} disabled={!draft.trim()} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-40">✨ Improve writing</button>
+                            <button type="button" onClick={() => composeWithAi("rewrite", "professional")} disabled={!draft.trim()} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-40">💼 Make it professional</button>
+                            <button type="button" onClick={() => composeWithAi("rewrite", "warm and friendly")} disabled={!draft.trim()} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-40">😊 Make it friendly</button>
+                            <button type="button" onClick={() => composeWithAi("rewrite", "short and concise")} disabled={!draft.trim()} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-40">✂️ Make it concise</button>
+                            <div className="my-1 border-t border-[var(--border)]" />
+                            <button type="button" onClick={() => composeWithAi("translate")} disabled={!draft.trim()} className="block w-full px-4 py-2 text-left text-sm hover:bg-[var(--bg-secondary)] disabled:opacity-40">🌐 Translate to English</button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  <input className="min-w-0 flex-1 rounded-2xl bg-[var(--field)] px-4 py-3 text-[15px] text-[var(--text)] shadow-sm outline-none placeholder:text-[var(--text-secondary)]" placeholder={editing ? "Edit your message" : "Message"} value={draft} onChange={(e) => handleDraftChange(e.target.value)} maxLength={2000} autoFocus={!!editing} />
+                  {!editing && !draft.trim() && !pendingAttachment ? (
+                    <button type="button" onClick={startRecording} title="Record voice message" className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white shadow-sm transition-all hover:bg-[var(--accent-hover)]">
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><rect x="9" y="3" width="6" height="12" rx="3" fill="currentColor" /><path d="M6 11a6 6 0 0 0 12 0M12 17v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+                    </button>
+                  ) : (
+                    <button type="submit" disabled={!draft.trim() && !pendingAttachment} title={editing ? "Save" : "Send"} className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white shadow-sm transition-all hover:bg-[var(--accent-hover)] disabled:opacity-50">
+                      {editing ? (
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M5 12.5l4 4L19 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
                       ) : (
-                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l8-8a3.5 3.5 0 1 1 5 5l-8 8a2 2 0 1 1-3-3l7.5-7.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 19V5m0 0-6 6m6-6 6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
                       )}
                     </button>
-                  </>
-                )}
-                <input className="min-w-0 flex-1 rounded-2xl bg-[var(--field)] px-4 py-3 text-[15px] text-[var(--text)] shadow-sm outline-none placeholder:text-[var(--text-secondary)]" placeholder={editing ? "Edit your message" : "Message"} value={draft} onChange={(e) => handleDraftChange(e.target.value)} maxLength={2000} autoFocus={!!editing} />
-                <button type="submit" disabled={!draft.trim() && !pendingAttachment} title={editing ? "Save" : "Send"} className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-white shadow-sm transition-all hover:bg-[var(--accent-hover)] disabled:opacity-50">
-                  {editing ? (
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M5 12.5l4 4L19 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
-                  ) : (
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 19V5m0 0-6 6m6-6 6 6" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" /></svg>
                   )}
-                </button>
-              </div>
+                </div>
+              )}
             </form>
           </>
         ) : (
@@ -1253,10 +1667,37 @@ export default function ChatPage() {
                 </div>
               </>
             ) : (
-              <div className="border-b border-[var(--border)] px-6 py-4">
-                <p className="text-[13px] font-medium uppercase tracking-wide text-[var(--text-secondary)]">Bio</p>
-                <p className="mt-1.5 whitespace-pre-wrap text-[15px]">{otherInDm?.bio || "No bio yet."}</p>
-              </div>
+              <>
+                <div className="border-b border-[var(--border)] px-6 py-4">
+                  <p className="text-[13px] font-medium uppercase tracking-wide text-[var(--text-secondary)]">Bio</p>
+                  <p className="mt-1.5 whitespace-pre-wrap text-[15px]">{otherInDm?.bio || "No bio yet."}</p>
+                </div>
+                {otherInDm && (
+                  <div className="space-y-1 px-3 py-3">
+                    <button
+                      onClick={() => blockUser(userId(otherInDm), !me.blocked?.includes(userId(otherInDm)))}
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[15px] text-[var(--danger)] hover:bg-red-500/10"
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" /><path d="m5.6 5.6 12.8 12.8" stroke="currentColor" strokeWidth="1.8" /></svg>
+                      {me.blocked?.includes(userId(otherInDm)) ? "Unblock user" : "Block user"}
+                    </button>
+                    <button
+                      onClick={() => reportUser(userId(otherInDm))}
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[15px] text-[var(--danger)] hover:bg-red-500/10"
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M5 21V4h9l1 2h5v9h-6l-1-2H7v8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                      Report user
+                    </button>
+                    <button
+                      onClick={() => deleteChat(activeRoom._id)}
+                      className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[15px] text-[var(--danger)] hover:bg-red-500/10"
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M6 7h12M9 7V5h6v2m-7 0 1 12h6l1-12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                      Delete chat
+                    </button>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </section>
@@ -1264,6 +1705,99 @@ export default function ChatPage() {
 
       {/* ================= Settings ================= */}
       {showSettings && <SettingsModal me={me} onClose={() => setShowSettings(false)} onUpdated={handleProfileUpdated} />}
+
+      {/* Copied / report toasts */}
+      {copied && (
+        <div className="fixed bottom-6 left-1/2 z-[70] -translate-x-1/2 rounded-full bg-[var(--panel)] px-4 py-2 text-sm shadow-lg ring-1 ring-[var(--border)]">
+          Copied to clipboard
+        </div>
+      )}
+      {reportSent && (
+        <div className="fixed bottom-6 left-1/2 z-[70] -translate-x-1/2 rounded-full bg-[var(--panel)] px-4 py-2 text-sm shadow-lg ring-1 ring-[var(--border)]">
+          Report submitted — thank you
+        </div>
+      )}
+      {aiError && (
+        <div className="fixed bottom-6 left-1/2 z-[70] -translate-x-1/2 rounded-full bg-[var(--panel)] px-4 py-2 text-sm text-[var(--danger)] shadow-lg ring-1 ring-[var(--border)]">
+          {aiError}
+        </div>
+      )}
+
+      {/* Starred messages */}
+      {starred && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay)] px-4" onClick={() => setStarred(null)}>
+          <div className="flex max-h-[75vh] w-full max-w-md flex-col rounded-2xl bg-[var(--panel)] p-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-3 flex items-center gap-2 px-2">
+              <h2 className="flex-1 text-lg font-semibold">Starred messages</h2>
+              <button onClick={() => setStarred(null)} title="Close" className="rounded-full p-1.5 text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" /></svg>
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
+              {starred.length === 0 ? (
+                <p className="py-8 text-center text-sm text-[var(--text-secondary)]">No starred messages yet. Star one from its menu.</p>
+              ) : (
+                starred.map((m) => (
+                  <div key={m._id} className="flex items-start gap-3 rounded-xl px-3 py-2">
+                    <Avatar name={m.sender.username} src={m.sender.avatar} size={36} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="truncate text-sm font-medium">{m.sender.username}</span>
+                        <span className="shrink-0 text-xs text-[var(--text-secondary)]">{fmtListTime(m.timestamp)}</span>
+                      </div>
+                      <p className="truncate text-sm text-[var(--text-secondary)]">{attachmentLabel(m)}</p>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Forward picker */}
+      {forwardMsg && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay)] px-4" onClick={() => setForwardMsg(null)}>
+          <div className="flex max-h-[70vh] w-full max-w-sm flex-col rounded-2xl bg-[var(--panel)] p-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h2 className="mb-1 px-2 text-lg font-semibold">Forward to…</h2>
+            <p className="mb-3 truncate px-2 text-sm text-[var(--text-secondary)]">{attachmentLabel(forwardMsg)}</p>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {rooms.length === 0 ? (
+                <p className="py-6 text-center text-sm text-[var(--text-secondary)]">No chats to forward to.</p>
+              ) : (
+                rooms.map((room) => (
+                  <button key={room._id} onClick={() => doForward(room._id)} className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left hover:bg-[var(--bg-secondary)]">
+                    <Avatar name={displayName(room, meId)} src={roomAvatar(room, meId)} size={40} />
+                    <span className="truncate font-medium">{displayName(room, meId)}</span>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Seen-by modal */}
+      {seenBy && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay)] px-4" onClick={() => setSeenBy(null)}>
+          <div className="flex max-h-[70vh] w-full max-w-xs flex-col rounded-2xl bg-[var(--panel)] p-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h2 className="mb-3 px-2 text-lg font-semibold">Read by {seenBy.readers.length}</h2>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              {seenBy.readers.length === 0 ? (
+                <p className="py-6 text-center text-sm text-[var(--text-secondary)]">No one has read this yet.</p>
+              ) : (
+                seenBy.readers.map((u) => (
+                  <div key={userId(u)} className="flex items-center gap-3 rounded-xl px-3 py-2">
+                    <Avatar name={u.username} src={u.avatar} size={36} />
+                    <span className="truncate">{u.username}</span>
+                  </div>
+                ))
+              )}
+            </div>
+            <button onClick={() => setSeenBy(null)} className="mt-2 rounded-xl px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-secondary)]">Close</button>
+          </div>
+        </div>
+      )}
 
       {/* ================= Voice / video call ================= */}
       <CallOverlay call={call} />

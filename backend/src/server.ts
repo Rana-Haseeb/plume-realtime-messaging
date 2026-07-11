@@ -9,6 +9,7 @@ dotenv.config();
 
 import authRoutes, { AVATAR_DIR } from "./routes/auth";
 import roomRoutes, { MEDIA_DIR } from "./routes/rooms";
+import aiRoutes from "./routes/ai";
 import { registerSocketHandlers, ChatServer } from "./socket";
 import { rateLimit } from "./middleware/rateLimit";
 
@@ -46,6 +47,7 @@ app.get("/", (_req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/rooms", roomRoutes);
+app.use("/api/ai", aiRoutes);
 
 const server = http.createServer(app);
 

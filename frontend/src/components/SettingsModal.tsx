@@ -9,6 +9,12 @@ import {
   setTheme as persistTheme,
 } from "@/lib/theme";
 import {
+  Wallpaper,
+  WALLPAPERS,
+  getStoredWallpaper,
+  setWallpaper as persistWallpaper,
+} from "@/lib/wallpaper";
+import {
   NotificationPrefs,
   getNotificationPrefs,
   notificationPermission,
@@ -192,6 +198,7 @@ export default function SettingsModal({
 
   // Chats (theme)
   const [theme, setThemeState] = useState<Theme>(getStoredTheme());
+  const [wallpaper, setWallpaperState] = useState<Wallpaper>(getStoredWallpaper());
 
   // Notifications
   const [notif, setNotif] = useState<NotificationPrefs>(getNotificationPrefs());
@@ -270,6 +277,11 @@ export default function SettingsModal({
     } finally {
       setSavingPw(false);
     }
+  }
+
+  function changeWallpaper(w: Wallpaper) {
+    setWallpaperState(w);
+    persistWallpaper(w);
   }
 
   function changeTheme(t: Theme) {
@@ -534,6 +546,51 @@ export default function SettingsModal({
                     <span className="text-[15px] font-medium capitalize">
                       {t}
                       {theme === t && (
+                        <span className="ml-1.5 text-[var(--accent)]">✓</span>
+                      )}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              <p className="pt-3 text-[13px] font-medium text-[var(--text-secondary)]">
+                Chat wallpaper
+              </p>
+              <div className="grid grid-cols-2 gap-3">
+                {WALLPAPERS.map((w) => (
+                  <button
+                    key={w.id}
+                    onClick={() => changeWallpaper(w.id)}
+                    className={`flex flex-col items-center gap-2 rounded-2xl border-2 p-3 transition-colors ${
+                      wallpaper === w.id
+                        ? "border-[var(--accent)]"
+                        : "border-[var(--border)] hover:border-[var(--text-secondary)]"
+                    }`}
+                  >
+                    <div
+                      className="flex h-14 w-full items-center justify-center rounded-lg border border-[var(--border)] text-xl"
+                      style={
+                        w.id === "dots"
+                          ? {
+                              backgroundColor: "var(--chat-bg)",
+                              backgroundImage:
+                                "radial-gradient(rgba(122,129,153,0.35) 1.5px, transparent 1.5px)",
+                              backgroundSize: "10px 10px",
+                            }
+                          : w.id === "geometric"
+                            ? {
+                                backgroundColor: "var(--chat-bg)",
+                                backgroundImage:
+                                  "repeating-linear-gradient(45deg, rgba(122,129,153,0.25) 0 1px, transparent 1px 10px)",
+                              }
+                            : { backgroundColor: "var(--chat-bg)" }
+                      }
+                    >
+                      {w.id === "doodles" ? "🪶" : ""}
+                    </div>
+                    <span className="text-[14px] font-medium">
+                      {w.label}
+                      {wallpaper === w.id && (
                         <span className="ml-1.5 text-[var(--accent)]">✓</span>
                       )}
                     </span>
